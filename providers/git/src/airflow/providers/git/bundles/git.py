@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import os
 import shutil
-from contextlib import nullcontext
-from pathlib import Path
 from urllib.parse import urlparse
-
+import fcntl
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 import structlog
 from git import Repo
 from git.exc import BadName, GitCommandError, InvalidGitRepositoryError, NoSuchPathError
@@ -44,6 +44,7 @@ class GitDagBundle(BaseDagBundle):
     :param tracking_ref: Branch or tag for this DAG bundle
     :param subdir: Subdirectory within the repository where the DAGs are stored (Optional)
     :param git_conn_id: Connection ID for SSH/token based connection to the repository (Optional)
+    :param submodules: Whether to initialize git submodules (default: False)
     :param repo_url: Explicit Git repository URL to override the connection's host. (Optional)
     :param prune_dotgit_folder: Remove .git folder from the versions after cloning.
 
@@ -61,6 +62,7 @@ class GitDagBundle(BaseDagBundle):
         tracking_ref: str,
         subdir: str | None = None,
         git_conn_id: str | None = None,
+        submodules: bool = False,
         repo_url: str | None = None,
         prune_dotgit_folder: bool = True,
         **kwargs,
@@ -76,6 +78,7 @@ class GitDagBundle(BaseDagBundle):
         self.git_conn_id = git_conn_id
         self.repo_url = repo_url
         self.prune_dotgit_folder = prune_dotgit_folder
+        self.submodules = submodules
 
         self._log = log.bind(
             bundle_name=self.name,
@@ -84,6 +87,7 @@ class GitDagBundle(BaseDagBundle):
             repo_path=self.repo_path,
             versions_path=self.versions_dir,
             git_conn_id=self.git_conn_id,
+            submodules=self.submodules,
         )
 
         self._log.debug("bundle configured")
@@ -124,10 +128,20 @@ class GitDagBundle(BaseDagBundle):
                     self.repo.remotes.origin.fetch()
                 self.repo.head.set_reference(str(self.repo.commit(self.version)))
                 self.repo.head.reset(index=True, working_tree=True)
+
+                if self.submodules:
+                    cm_sub = self.hook.configure_hook_env() if self.hook else nullcontext()
+                    with cm_sub:
+                        try:
+                            self._fetch_submodules()
+                        except GitCommandError as e:
+                            raise RuntimeError("Error pulling submodule from repository") from e
+
                 if self.prune_dotgit_folder:
                     shutil.rmtree(self.repo_path / ".git")
             else:
                 self.refresh()
+
             self.repo.close()
 
     def initialize(self) -> None:
@@ -244,6 +258,17 @@ class GitDagBundle(BaseDagBundle):
             self.bare_repo.remotes.origin.fetch(refspecs)
             self.bare_repo.close()
 
+
+    @retry(
+        retry=retry_if_exception_type((GitCommandError,)),
+        stop=stop_after_attempt(2),
+        reraise=True,
+    )
+    def _fetch_submodules(self) -> None:
+        self._log.info("Initializing and updating submodules", repo_path=self.repo_path)
+        self.repo.git.submodule('sync', '--recursive')
+        self.repo.git.submodule('update', '--init', '--recursive', '--jobs', '1')
+
     def refresh(self) -> None:
         if self.version:
             raise AirflowException("Refreshing a specific version is not supported")
@@ -261,6 +286,13 @@ class GitDagBundle(BaseDagBundle):
                 else:
                     target = self.tracking_ref
                 self.repo.head.reset(target, index=True, working_tree=True)
+
+                if self.submodules:
+                    try:
+                        self._fetch_submodules()
+                    except GitCommandError as e:
+                        raise RuntimeError("Error pulling submodule from repository") from e
+
                 self.repo.close()
 
     @staticmethod
